@@ -5,15 +5,30 @@ declare(strict_types=1);
 namespace PhpUpgradePreflight\Laravel\Rules;
 
 use PhpUpgradePreflight\Core\Framework\CompatibilityRule;
+use PhpUpgradePreflight\Core\Framework\HopAwareCompatibilityRule;
 use PhpUpgradePreflight\Core\Model\CompatibilityFinding;
 use PhpUpgradePreflight\Core\Model\Evidence;
 use PhpUpgradePreflight\Core\Model\EvidenceLedger;
+use PhpUpgradePreflight\Core\Model\FrameworkHop;
 use PhpUpgradePreflight\Core\Model\ProjectState;
 use PhpUpgradePreflight\Core\Model\SourceUsage;
 use PhpUpgradePreflight\Core\Model\UpgradeRequest;
+use PhpUpgradePreflight\Laravel\Catalog\BuiltinRuleDefinition;
+use PhpUpgradePreflight\Laravel\Catalog\SkeletonPattern;
 
-final class LaravelSkeletonRule implements CompatibilityRule
+final class LaravelSkeletonRule implements CompatibilityRule, HopAwareCompatibilityRule
 {
+    private BuiltinRuleDefinition $definition;
+    /** @var list<SkeletonPattern> */
+    private array $patterns;
+
+    /** @param list<SkeletonPattern> $patterns */
+    public function __construct(BuiltinRuleDefinition $definition, array $patterns)
+    {
+        $this->definition = $definition;
+        $this->patterns = $patterns;
+    }
+
     public function evaluate(
         ProjectState $project,
         UpgradeRequest $request,
@@ -21,27 +36,63 @@ final class LaravelSkeletonRule implements CompatibilityRule
         array $sourceUsages = []
     ): ?CompatibilityFinding {
         $target = LaravelTarget::fromRequest($request);
-        if ($target === null || !LaravelTarget::isLaravel7Project($project)) {
+        $sourceMajor = LaravelSource::fromProject($project)->major();
+        if ($target === null || $sourceMajor === null) {
+            return null;
+        }
+
+        return $this->evaluateTransition($evidence, $sourceUsages, $sourceMajor, $target->major());
+    }
+
+    public function evaluateForHop(
+        ProjectState $project,
+        UpgradeRequest $request,
+        EvidenceLedger $evidence,
+        FrameworkHop $hop,
+        ?string $composerVersion = null,
+        array $sourceUsages = []
+    ): ?CompatibilityFinding {
+        $requestedTarget = LaravelTarget::fromRequest($request);
+        $requestedSource = LaravelSource::fromProject($project)->major();
+        if ($requestedTarget !== null
+            && $requestedSource !== null
+            && $this->definition->appliesTo($requestedSource, $requestedTarget->major())) {
+            if ($hop->toMajor() !== $requestedTarget->major()) {
+                return null;
+            }
+
+            return $this->evaluateTransition(
+                $evidence,
+                $sourceUsages,
+                $requestedSource,
+                $requestedTarget->major()
+            );
+        }
+
+        return $this->evaluateTransition($evidence, $sourceUsages, $hop->fromMajor(), $hop->toMajor());
+    }
+
+    /** @param list<SourceUsage> $sourceUsages */
+    private function evaluateTransition(
+        EvidenceLedger $evidence,
+        array $sourceUsages,
+        int $sourceMajor,
+        int $targetMajor
+    ): ?CompatibilityFinding {
+        if (!$this->definition->appliesTo($sourceMajor, $targetMajor)) {
             return null;
         }
 
         $matched = array_values(array_filter(
             $sourceUsages,
-            static function (SourceUsage $usage): bool {
-                $file = strtolower(str_replace('\\', '/', $usage->file()));
-
-                if ($file === 'app/http/kernel.php' && $usage->usageType() === 'middleware_reference') {
-                    return true;
+            function (SourceUsage $usage): bool {
+                foreach ($this->patterns as $pattern) {
+                    if ($this->matches($usage, $pattern)) {
+                        return true;
+                    }
                 }
 
-                if ($file === 'config/app.php'
-                    && in_array($usage->usageType(), ['service_provider', 'facade_alias'], true)) {
-                    return true;
-                }
-
-                return $file === 'app/http/middleware/trustproxies.php'
-                    && $usage->usageType() === 'inheritance'
-                    && strtolower($usage->symbol()) === 'fideloper\\proxy\\trustproxies';
+                return false;
             }
         ));
 
@@ -67,7 +118,7 @@ final class LaravelSkeletonRule implements CompatibilityRule
             'Detected Kernel middleware, application provider/alias entries, or TrustProxies inheritance identify skeleton-managed integration points for manual comparison.',
             'low',
             [
-                'target_laravel_major' => $target->major(),
+                'target_laravel_major' => $targetMajor,
                 'indicator_count' => count($indicators),
                 'indicators' => $indicators,
                 'claim' => 'review_location_only',
@@ -79,9 +130,19 @@ final class LaravelSkeletonRule implements CompatibilityRule
             'low',
             sprintf(
                 'Compare detected Laravel skeleton-managed integration locations (Kernel middleware, app config providers/aliases, or TrustProxies inheritance) with the Laravel %d skeleton; these are review locations, not confirmed incompatibilities.',
-                $target->major()
+                $targetMajor
             ),
             array_values(array_unique(array_merge($sourceEvidence, [$heuristicId])))
         );
+    }
+
+    private function matches(SourceUsage $usage, SkeletonPattern $pattern): bool
+    {
+        if (strtolower(str_replace('\\', '/', $usage->file())) !== $pattern->file()
+            || !in_array($usage->usageType(), $pattern->usageTypes(), true)) {
+            return false;
+        }
+
+        return $pattern->symbol() === null || strtolower($usage->symbol()) === $pattern->symbol();
     }
 }

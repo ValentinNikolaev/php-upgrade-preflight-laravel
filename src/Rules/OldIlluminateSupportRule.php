@@ -5,13 +5,16 @@ declare(strict_types=1);
 namespace PhpUpgradePreflight\Laravel\Rules;
 
 use PhpUpgradePreflight\Core\Framework\CompatibilityRule;
+use PhpUpgradePreflight\Core\Framework\HopAwareCompatibilityRule;
 use PhpUpgradePreflight\Core\Model\CompatibilityFinding;
 use PhpUpgradePreflight\Core\Model\Evidence;
 use PhpUpgradePreflight\Core\Model\EvidenceLedger;
+use PhpUpgradePreflight\Core\Model\FrameworkHop;
 use PhpUpgradePreflight\Core\Model\ProjectState;
 use PhpUpgradePreflight\Core\Model\UpgradeRequest;
+use PhpUpgradePreflight\Laravel\Catalog\BuiltinRuleDefinition;
 
-final class OldIlluminateSupportRule implements CompatibilityRule
+final class OldIlluminateSupportRule implements CompatibilityRule, HopAwareCompatibilityRule
 {
     private const SPECIALIZED_PACKAGES = [
         'laravel/horizon',
@@ -20,6 +23,13 @@ final class OldIlluminateSupportRule implements CompatibilityRule
         'laravel/telescope',
     ];
 
+    private BuiltinRuleDefinition $definition;
+
+    public function __construct(BuiltinRuleDefinition $definition)
+    {
+        $this->definition = $definition;
+    }
+
     public function evaluate(
         ProjectState $project,
         UpgradeRequest $request,
@@ -27,7 +37,52 @@ final class OldIlluminateSupportRule implements CompatibilityRule
         array $sourceUsages = []
     ): ?CompatibilityFinding {
         $target = LaravelTarget::fromRequest($request);
-        if ($target === null || !LaravelTarget::isLaravel7Project($project)) {
+        $sourceMajor = LaravelSource::fromProject($project)->major();
+        if ($target === null || $sourceMajor === null) {
+            return null;
+        }
+
+        return $this->evaluateTransition($project, $evidence, $sourceMajor, $target);
+    }
+
+    public function evaluateForHop(
+        ProjectState $project,
+        UpgradeRequest $request,
+        EvidenceLedger $evidence,
+        FrameworkHop $hop,
+        ?string $composerVersion = null,
+        array $sourceUsages = []
+    ): ?CompatibilityFinding {
+        if (LaravelTarget::fromRequest($request) === null) {
+            return null;
+        }
+
+        $earlierTargets = [];
+        $sourceMajor = LaravelSource::fromProject($project)->major();
+        if ($sourceMajor !== null && $hop->toMajor() === $hop->fromMajor() + 1) {
+            for ($major = $sourceMajor + 1; $major < $hop->toMajor(); ++$major) {
+                $earlierTargets[] = LaravelTarget::forMajor($major);
+            }
+        }
+
+        return $this->evaluateTransition(
+            $project,
+            $evidence,
+            $hop->fromMajor(),
+            LaravelTarget::forMajor($hop->toMajor()),
+            $earlierTargets
+        );
+    }
+
+    /** @param list<LaravelTarget> $earlierTargets */
+    private function evaluateTransition(
+        ProjectState $project,
+        EvidenceLedger $evidence,
+        int $sourceMajor,
+        LaravelTarget $target,
+        array $earlierTargets = []
+    ): ?CompatibilityFinding {
+        if (!$this->definition->appliesTo($sourceMajor, $target->major())) {
             return null;
         }
 
@@ -36,7 +91,8 @@ final class OldIlluminateSupportRule implements CompatibilityRule
         $rootConstraint = $project->composerJson()->rootRequirements()['illuminate/support'] ?? null;
 
         if ($rootConstraint !== null
-            && !$target->intersectsRequestedFrameworkRange($rootConstraint)) {
+            && !$target->intersectsRequestedFrameworkRange($rootConstraint)
+            && !$this->excludedByAnyTarget($rootConstraint, $earlierTargets)) {
             $blockingPackages['illuminate/support'] = $rootConstraint;
             $references[] = $evidence->add(
                 'old-illuminate-support',
@@ -63,7 +119,8 @@ final class OldIlluminateSupportRule implements CompatibilityRule
             $requirements = $package['require'] ?? [];
             $constraint = is_array($requirements) ? ($requirements['illuminate/support'] ?? null) : null;
             if (!is_string($constraint)
-                || $target->intersectsRequestedFrameworkRange($constraint)) {
+                || $target->intersectsRequestedFrameworkRange($constraint)
+                || $this->excludedByAnyTarget($constraint, $earlierTargets)) {
                 continue;
             }
 
@@ -98,6 +155,18 @@ final class OldIlluminateSupportRule implements CompatibilityRule
             ),
             $references
         );
+    }
+
+    /** @param list<LaravelTarget> $targets */
+    private function excludedByAnyTarget(string $constraint, array $targets): bool
+    {
+        foreach ($targets as $target) {
+            if (!$target->intersectsRequestedFrameworkRange($constraint)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /** @return list<array<string, mixed>> */

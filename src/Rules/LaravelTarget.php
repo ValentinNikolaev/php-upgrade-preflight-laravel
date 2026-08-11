@@ -7,7 +7,6 @@ namespace PhpUpgradePreflight\Laravel\Rules;
 use Composer\Semver\Intervals;
 use Composer\Semver\Semver;
 use Composer\Semver\VersionParser;
-use PhpUpgradePreflight\Core\Model\ProjectState;
 use PhpUpgradePreflight\Core\Model\UpgradeRequest;
 
 final class LaravelTarget
@@ -37,13 +36,15 @@ final class LaravelTarget
                 continue;
             }
 
-            $major = self::singleSupportedMajor($target->constraint());
+            $major = self::majorFromConstraint($target->constraint());
             if ($major === null || ($selectedMajor !== null && $selectedMajor !== $major)) {
                 return null;
             }
 
             $selectedMajor = $major;
-            $selectedConstraint = $target->constraint();
+            if ($selectedConstraint === null || $package === 'laravel/framework') {
+                $selectedConstraint = $target->constraint();
+            }
             $requestedConstraints[$package] = $target->constraint();
         }
 
@@ -52,31 +53,15 @@ final class LaravelTarget
             : new self($selectedMajor, $selectedConstraint, $requestedConstraints);
     }
 
-    public static function isLaravel7Project(ProjectState $project): bool
+    public static function forMajor(int $major): self
     {
-        $lockedFramework = $project->composerLock()->package('laravel/framework');
-        if ($lockedFramework !== null) {
-            return self::versionSatisfies($lockedFramework->version(), '^7.0');
+        if ($major < 0) {
+            throw new \InvalidArgumentException('A Laravel target major must be non-negative.');
         }
 
-        $requirements = $project->composerJson()->rootRequirements();
-        $observations = [];
-        foreach ($requirements as $package => $constraint) {
-            if ($package !== 'laravel/framework' && !str_starts_with($package, 'illuminate/')) {
-                continue;
-            }
+        $constraint = '^' . $major . '.0';
 
-            $locked = $project->composerLock()->package($package);
-            if ($locked !== null) {
-                $observations[] = self::versionSatisfies($locked->version(), '^7.0');
-                continue;
-            }
-
-            $observations[] = self::constraintsIntersect($constraint, '^7.0')
-                && !self::constraintsIntersect($constraint, '^8.0|^9.0');
-        }
-
-        return $observations !== [] && !in_array(false, $observations, true);
+        return new self($major, $constraint, ['laravel/framework' => $constraint]);
     }
 
     public function major(): int
@@ -87,6 +72,12 @@ final class LaravelTarget
     public function requestedConstraint(): string
     {
         return $this->requestedConstraint;
+    }
+
+    /** @return array<string, string> */
+    public function requestedConstraints(): array
+    {
+        return $this->requestedConstraints;
     }
 
     public function frameworkRange(): string
@@ -103,11 +94,6 @@ final class LaravelTarget
         }
 
         return $this->requestedConstraints !== [];
-    }
-
-    public function phpRange(): string
-    {
-        return $this->major === 8 ? '^7.3|^8.0' : '^8.0.2';
     }
 
     public static function constraintsIntersect(string $left, string $right): bool
@@ -133,22 +119,27 @@ final class LaravelTarget
         }
     }
 
-    private static function singleSupportedMajor(string $constraint): ?int
+    public static function majorFromConstraint(string $constraint): ?int
     {
         try {
             $parser = new VersionParser();
             $candidate = $parser->parseConstraints($constraint);
-
-            foreach ([8, 9] as $major) {
-                $supportedMajor = $parser->parseConstraints('^' . $major . '.0');
-                if (Intervals::isSubsetOf($candidate, $supportedMajor)) {
-                    return $major;
-                }
+            $intervals = Intervals::get($candidate);
+            if ($intervals['numeric'] === [] || $intervals['branches']['exclude'] || $intervals['branches']['names'] !== []) {
+                return null;
             }
+
+            $startVersion = $intervals['numeric'][0]->getStart()->getVersion();
+            if (preg_match('/^(0|[1-9]\d*)\./', $startVersion, $matches) !== 1) {
+                return null;
+            }
+
+            $major = (int) $matches[1];
+            $majorRange = $parser->parseConstraints(sprintf('>=%d.0.0 <%d.0.0', $major, $major + 1));
+
+            return Intervals::isSubsetOf($candidate, $majorRange) ? $major : null;
         } catch (\UnexpectedValueException $exception) {
             return null;
         }
-
-        return null;
     }
 }

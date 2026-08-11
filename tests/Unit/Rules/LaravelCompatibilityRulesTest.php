@@ -9,6 +9,7 @@ use PhpUpgradePreflight\Core\Model\ComposerJson;
 use PhpUpgradePreflight\Core\Model\ComposerLock;
 use PhpUpgradePreflight\Core\Model\Evidence;
 use PhpUpgradePreflight\Core\Model\EvidenceLedger;
+use PhpUpgradePreflight\Core\Model\ExtensionAssumption;
 use PhpUpgradePreflight\Core\Model\ProjectState;
 use PhpUpgradePreflight\Core\Model\SourceUsage;
 use PhpUpgradePreflight\Core\Model\UpgradeRequest;
@@ -112,6 +113,65 @@ final class LaravelCompatibilityRulesTest extends TestCase
         ));
         self::assertCount(1, $consumerEvidence);
         self::assertSame('^7.0', $consumerEvidence[0]->context()['illuminate_support_constraint']);
+    }
+
+    public function testMultiMajorIlluminateConsumerIsAttributedToTheFirstIncompatibleHop(): void
+    {
+        $project = $this->project(
+            ['laravel/framework' => '^10.0'],
+            [
+                $this->package('laravel/framework', 'v10.48.0'),
+                $this->package('legacy/package', '1.0.0', ['illuminate/support' => '^10.0']),
+            ]
+        );
+
+        $findings = $this->evaluate(
+            $project,
+            $this->request('^13.0', '8.3'),
+            new EvidenceLedger(),
+            [],
+            true
+        );
+        $legacy = array_values(array_filter(
+            $findings,
+            static fn ($finding): bool => stripos($finding->summary(), 'legacy/package') !== false
+        ));
+
+        self::assertNotSame([], $legacy);
+        self::assertSame(
+            [['from_major' => 10, 'to_major' => 11]],
+            $legacy[0]->appliesToHops()
+        );
+        self::assertStringContainsString('Laravel 11', $legacy[0]->summary());
+    }
+
+    public function testMultiMajorIlluminateConsumerRemainsOnTheFirstHopItsRangeExcludes(): void
+    {
+        $project = $this->project(
+            ['laravel/framework' => '^10.0'],
+            [
+                $this->package('laravel/framework', 'v10.48.0'),
+                $this->package('legacy/package', '1.0.0', ['illuminate/support' => '^10.0|^11.0']),
+            ]
+        );
+
+        $legacy = array_values(array_filter(
+            $this->evaluate(
+                $project,
+                $this->request('^13.0', '8.3'),
+                new EvidenceLedger(),
+                [],
+                true
+            ),
+            static fn ($finding): bool => stripos($finding->summary(), 'legacy/package') !== false
+        ));
+
+        self::assertNotSame([], $legacy);
+        self::assertSame(
+            [['from_major' => 11, 'to_major' => 12]],
+            $legacy[0]->appliesToHops()
+        );
+        self::assertStringContainsString('Laravel 12', $legacy[0]->summary());
     }
 
     public function testSkeletonReviewUsesExactSourceEvidenceAndSeparateHeuristicGuidance(): void
@@ -230,6 +290,136 @@ final class LaravelCompatibilityRulesTest extends TestCase
         );
 
         self::assertTrue($this->contains($summaries, 'phpunit/phpunit'));
+    }
+
+    public function testMultiMajorUpgradeRunsAndScopesEachCoveredHop(): void
+    {
+        $project = $this->project(
+            ['laravel/framework' => '^7.0', 'facade/ignition' => '^1.0', 'phpunit/phpunit' => '^8.0'],
+            [
+                $this->package('laravel/framework', 'v7.30.7'),
+                $this->package('facade/ignition', '1.16.4'),
+                $this->package('phpunit/phpunit', '8.5.21'),
+            ]
+        );
+
+        $findings = $this->evaluate(
+            $project,
+            $this->request('^10.0', '8.1'),
+            new EvidenceLedger(),
+            [],
+            true,
+            '2.8.12'
+        );
+
+        $framework = array_values(array_filter(
+            $findings,
+            static fn ($finding): bool => strpos($finding->summary(), 'root laravel/framework constraint') !== false
+        ));
+        self::assertCount(1, $framework);
+        self::assertSame([['from_major' => 9, 'to_major' => 10]], $framework[0]->appliesToHops());
+
+        $phpunitHops = [];
+        foreach ($findings as $finding) {
+            if (strpos($finding->summary(), 'phpunit/phpunit') !== false) {
+                $phpunitHops[] = $finding->appliesToHops()[0];
+            }
+        }
+        self::assertSame([
+            ['from_major' => 7, 'to_major' => 8],
+            ['from_major' => 8, 'to_major' => 9],
+            ['from_major' => 9, 'to_major' => 10],
+        ], $phpunitHops);
+
+        $ignitionHops = [];
+        foreach ($findings as $finding) {
+            if (strpos($finding->summary(), 'facade/ignition') !== false) {
+                $ignitionHops[] = $finding->appliesToHops()[0];
+            }
+        }
+        self::assertSame([
+            ['from_major' => 7, 'to_major' => 8],
+            ['from_major' => 8, 'to_major' => 9],
+        ], $ignitionHops);
+    }
+
+    public function testComposerRuleUsesRuntimeVersionInsteadOfLockGenerationMetadata(): void
+    {
+        $oldLockNewRuntime = new ProjectState(
+            __DIR__,
+            new ComposerJson(['require' => ['laravel/framework' => '^9.0']]),
+            new ComposerLock([
+                'plugin-api-version' => '2.1.0',
+                'packages' => [$this->package('laravel/framework', 'v9.52.16')],
+            ])
+        );
+        $newLockOldRuntime = new ProjectState(
+            __DIR__,
+            new ComposerJson(['require' => ['laravel/framework' => '^9.0']]),
+            new ComposerLock([
+                'plugin-api-version' => '2.8.0',
+                'packages' => [$this->package('laravel/framework', 'v9.52.16')],
+            ])
+        );
+        $request = $this->request('^10.0', '8.1');
+        $oldRuntimeEvidence = new EvidenceLedger();
+
+        $newRuntimeSummaries = array_map(
+            static fn ($finding): string => $finding->summary(),
+            $this->evaluate($oldLockNewRuntime, $request, new EvidenceLedger(), [], true, '2.8.12')
+        );
+        $oldRuntimeSummaries = array_map(
+            static fn ($finding): string => $finding->summary(),
+            $this->evaluate($newLockOldRuntime, $request, $oldRuntimeEvidence, [], true, '2.1.14')
+        );
+        $unknownRuntimeSummaries = array_map(
+            static fn ($finding): string => $finding->summary(),
+            $this->evaluate($newLockOldRuntime, $request, new EvidenceLedger(), [], true)
+        );
+
+        self::assertFalse($this->contains($newRuntimeSummaries, 'Composer `'));
+        self::assertTrue($this->contains($oldRuntimeSummaries, 'Composer `2.1.14`'));
+        self::assertFalse($this->contains($unknownRuntimeSummaries, 'Composer `'));
+        $runtimeEvidence = array_values(array_filter(
+            $oldRuntimeEvidence->all(),
+            static fn (Evidence $item): bool => isset($item->context()['composer_version'])
+        ));
+        self::assertCount(1, $runtimeEvidence);
+        self::assertSame(Evidence::E1_SOLVER, $runtimeEvidence[0]->evidenceClass());
+        self::assertSame('2.1.14', $runtimeEvidence[0]->context()['composer_version']);
+    }
+
+    public function testCurlRuleDistinguishesAbsentPresentUnknownAndRequestOverride(): void
+    {
+        $requirements = ['laravel/framework' => '^10.0'];
+        $packages = [$this->package('laravel/framework', 'v10.48.0')];
+        $absent = new ProjectState(__DIR__, new ComposerJson([
+            'require' => $requirements,
+            'config' => ['platform' => ['ext-curl' => false]],
+        ]), new ComposerLock(['packages' => $packages]));
+        $present = new ProjectState(__DIR__, new ComposerJson([
+            'require' => $requirements,
+            'config' => ['platform' => ['ext-curl' => '8.2.0']],
+        ]), new ComposerLock(['packages' => $packages]));
+        $unknown = $this->project($requirements, $packages);
+        $request = $this->request('^11.0', '8.2');
+        $overrideRequest = new UpgradeRequest(
+            __DIR__,
+            [new UpgradeTarget('laravel/framework', '^11.0')],
+            null,
+            '8.2',
+            [],
+            [],
+            'json',
+            null,
+            false,
+            [ExtensionAssumption::fromPresenceInput('ext-curl')]
+        );
+
+        self::assertTrue($this->contains($this->summaries($this->evaluate($absent, $request, new EvidenceLedger(), [], true)), 'curl is `absent`'));
+        self::assertFalse($this->contains($this->summaries($this->evaluate($present, $request, new EvidenceLedger(), [], true)), 'curl is `absent`'));
+        self::assertFalse($this->contains($this->summaries($this->evaluate($unknown, $request, new EvidenceLedger(), [], true)), 'curl is `absent`'));
+        self::assertFalse($this->contains($this->summaries($this->evaluate($absent, $overrideRequest, new EvidenceLedger(), [], true)), 'curl is `absent`'));
     }
 
     public function testLaravel9PackageGuidanceUsesLaravel9Sources(): void
@@ -367,6 +557,41 @@ final class LaravelCompatibilityRulesTest extends TestCase
         self::assertTrue($this->contains($summaries, 'framework constraints that exclude Laravel 8'));
     }
 
+    public function testLaravel13SymfonyGuidanceUsesExactComponentSpecificMinimums(): void
+    {
+        $project = $this->project(
+            [
+                'laravel/framework' => '^12.0',
+                'symfony/console' => '7.4.0',
+                'symfony/http-foundation' => '7.4.0',
+                'symfony/process' => '7.4.4',
+            ],
+            [
+                $this->package('laravel/framework', 'v12.20.0'),
+                $this->package('symfony/console', 'v7.4.0'),
+                $this->package('symfony/http-foundation', 'v7.4.0'),
+                $this->package('symfony/process', 'v7.4.4'),
+            ]
+        );
+
+        $summaries = $this->summaries($this->evaluate(
+            $project,
+            $this->request('^13.0', '8.3'),
+            new EvidenceLedger(),
+            [],
+            true
+        ));
+        $symfony = array_values(array_filter(
+            $summaries,
+            static fn (string $summary): bool => strpos($summary, 'direct Symfony component constraints') !== false
+        ));
+
+        self::assertCount(1, $symfony);
+        self::assertStringContainsString('symfony/http-foundation (`^7.4.13|^8.0.13`)', $symfony[0]);
+        self::assertStringContainsString('symfony/process (`^7.4.5|^8.0.5`)', $symfony[0]);
+        self::assertStringNotContainsString('symfony/console', $symfony[0]);
+    }
+
     /**
      * @param array<string, string> $requirements
      * @param list<array<string, mixed>> $packages
@@ -414,12 +639,31 @@ final class LaravelCompatibilityRulesTest extends TestCase
         ProjectState $project,
         UpgradeRequest $request,
         EvidenceLedger $evidence,
-        array $sourceUsages = []
+        array $sourceUsages = [],
+        bool $withGuidance = false,
+        ?string $composerVersion = null
     ): array {
         $integration = new LaravelFrameworkIntegration();
         $engine = new FrameworkRuleEngine([$integration]);
+        $guidance = $withGuidance
+            ? $engine->assessTransitions([$integration], $project, $request, $evidence)
+            : [];
 
-        return $engine->evaluate([$integration], $project, $request, $evidence, $sourceUsages);
+        return $engine->evaluate(
+            [$integration],
+            $project,
+            $request,
+            $evidence,
+            $sourceUsages,
+            $guidance,
+            $composerVersion
+        );
+    }
+
+    /** @return list<string> */
+    private function summaries(array $findings): array
+    {
+        return array_map(static fn ($finding): string => $finding->summary(), $findings);
     }
 
     /** @param list<string> $haystack */

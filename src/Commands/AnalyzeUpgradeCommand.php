@@ -6,12 +6,14 @@ namespace PhpUpgradePreflight\Laravel\Commands;
 
 use Illuminate\Console\Command;
 use PhpUpgradePreflight\Core\Contracts\UpgradeAnalyzer;
+use PhpUpgradePreflight\Core\Model\ExtensionAssumptionSet;
 use PhpUpgradePreflight\Core\Model\ReportFormat;
 use PhpUpgradePreflight\Core\Model\UpgradeRequest;
 use PhpUpgradePreflight\Core\Model\UpgradeTarget;
 use PhpUpgradePreflight\Core\Reporting\JsonReportWriter;
 use PhpUpgradePreflight\Core\Reporting\MarkdownReportWriter;
 use PhpUpgradePreflight\Core\Reporting\ReportFileWriter;
+use PhpUpgradePreflight\Core\Support\PathExposurePolicy;
 use PhpUpgradePreflight\Core\Support\SensitiveOutputRedactor;
 use Symfony\Component\Console\Output\OutputInterface;
 
@@ -24,6 +26,8 @@ final class AnalyzeUpgradeCommand extends Command
         {--target=* : Target constraint using package:constraint syntax}
         {--target-php= : Explicit target PHP platform version}
         {--from-php= : Current project PHP version}
+        {--with-extension=* : Assume an extension is present, optionally as ext-name:version}
+        {--without-extension=* : Assume an extension is absent}
         {--source=* : Additional source path to scan}
         {--format=json : json or markdown}
         {--output= : Report output path}
@@ -55,6 +59,10 @@ final class AnalyzeUpgradeCommand extends Command
             }
 
             $format = ReportFormat::normalize((string) $this->option('format'));
+            $extensionAssumptions = ExtensionAssumptionSet::fromInputs(
+                array_values((array) $this->option('with-extension')),
+                array_values((array) $this->option('without-extension'))
+            )->all();
             $request = new UpgradeRequest(
                 $this->projectPath(),
                 $targets,
@@ -64,7 +72,8 @@ final class AnalyzeUpgradeCommand extends Command
                 ['laravel'],
                 $format,
                 $this->optionalString('output'),
-                (bool) $this->option('debug')
+                (bool) $this->option('debug'),
+                $extensionAssumptions
             );
 
             if ($request->outputPath() !== null) {
@@ -88,7 +97,10 @@ final class AnalyzeUpgradeCommand extends Command
 
             if ($request->outputPath() !== null) {
                 $writtenPath = $this->reportFileWriter->write($request->projectPath(), $request->outputPath(), $rendered);
-                $this->info(sprintf('Wrote report to %s', $writtenPath));
+                $this->info(sprintf(
+                    'Wrote report to %s',
+                    PathExposurePolicy::operationalPath($writtenPath)
+                ));
             } else {
                 $this->output->writeln($rendered, OutputInterface::OUTPUT_RAW);
             }

@@ -13,6 +13,7 @@ use PhpUpgradePreflight\Core\Model\UpgradeRequest;
 use PhpUpgradePreflight\Core\Model\UpgradeTarget;
 use PhpUpgradePreflight\Core\Reporting\JsonReportWriter;
 use PhpUpgradePreflight\Core\Reporting\MarkdownReportWriter;
+use PhpUpgradePreflight\Core\Support\PathExposurePolicy;
 use PhpUpgradePreflight\Laravel\LaravelFrameworkIntegration;
 use PhpUpgradePreflight\Tests\Support\FixtureSnapshot;
 use PhpUpgradePreflight\Tests\Support\JsonSnapshotNormalizer;
@@ -49,7 +50,7 @@ final class LaravelFixtureAnalysisTest extends TestCase
         self::assertSame('blocked', $report->resolutionStatus());
         $this->assertFrameworkFindings($report, [
             'Update the root laravel/framework constraint from `^7.0` to a constraint compatible with Laravel 9.',
-            'Update or replace incompatible illuminate/support constraints before targeting Laravel 9: fixture/illuminate-consumer.',
+            'Update or replace incompatible illuminate/support constraints before targeting Laravel 8: fixture/illuminate-consumer.',
         ]);
         self::assertSame(
             ['transitive-package-conflict'],
@@ -135,6 +136,7 @@ final class LaravelFixtureAnalysisTest extends TestCase
         $this->assertAllReferencesExist($jsonReport);
         $this->assertAllReferencesExist($markdownReport);
         $this->assertFormatParity($jsonReport, $markdownReport);
+        $this->assertFrameworkGuidanceScopesFindings($jsonReport);
         $this->assertApprovedSnapshots($fixture, $projectPath, $jsonReport, $markdownReport);
 
         return $jsonReport;
@@ -298,6 +300,7 @@ final class LaravelFixtureAnalysisTest extends TestCase
         foreach ([$projectPath, str_replace('\\', '/', $projectPath), str_replace('/', '\\', $projectPath)] as $path) {
             $replacements[$path] = JsonSnapshotNormalizer::PROJECT_PATH;
         }
+        $replacements[PathExposurePolicy::PROJECT_ROOT] = JsonSnapshotNormalizer::PROJECT_PATH;
 
         foreach ($report->sourceImpact() as $usage) {
             $replacements[$usage->file()] = str_replace('\\', '/', $usage->file());
@@ -308,6 +311,8 @@ final class LaravelFixtureAnalysisTest extends TestCase
                 $replacements[$file] = str_replace('\\', '/', $file);
             }
         }
+
+        $replacements[PHP_VERSION] = JsonSnapshotNormalizer::ANALYZER_PHP_VERSION;
 
         uksort($replacements, static fn (string $left, string $right): int => strlen($right) <=> strlen($left));
         foreach ($replacements as $from => $to) {
@@ -359,10 +364,41 @@ final class LaravelFixtureAnalysisTest extends TestCase
             self::assertTrue($hasSource || $hasSources, sprintf('%s must link its documentation source.', $evidence->id()));
         }
 
-        foreach (array_merge($report->frameworkFindings(), $report->blockers(), $report->sourceImpact()) as $finding) {
+        foreach (array_merge(
+            $report->frameworkFindings(),
+            $report->blockers(),
+            $report->sourceImpact(),
+            $report->actionableSourceImpact(),
+            $report->frameworkGuidance()
+        ) as $finding) {
             self::assertNotSame([], $finding->evidence());
             foreach ($finding->evidence() as $reference) {
                 self::assertContains($reference, $evidenceIds);
+            }
+        }
+
+        foreach ($report->frameworkGuidance() as $guidance) {
+            foreach ($guidance->hops() as $hop) {
+                self::assertNotSame([], $hop->evidence());
+                foreach ($hop->evidence() as $reference) {
+                    self::assertContains($reference, $evidenceIds);
+                }
+            }
+        }
+    }
+
+    private function assertFrameworkGuidanceScopesFindings(UpgradeReport $report): void
+    {
+        self::assertCount(1, $report->frameworkGuidance());
+        $guidance = $report->frameworkGuidance()[0];
+        self::assertSame('supported', $guidance->toArray()['status']);
+        self::assertSame(7, $guidance->sourceMajor());
+        self::assertNotSame([], $guidance->supportedHopReferences());
+
+        foreach ($report->frameworkFindings() as $finding) {
+            self::assertNotSame([], $finding->appliesToHops());
+            foreach ($finding->appliesToHops() as $hop) {
+                self::assertContains($hop, $guidance->supportedHopReferences());
             }
         }
     }
