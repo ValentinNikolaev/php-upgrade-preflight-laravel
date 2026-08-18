@@ -11,6 +11,7 @@ final class LaravelRuleCatalogValidator
     /** @return list<string> */
     public function validate(LaravelRuleCatalog $catalog): array
     {
+        /** @var list<string> $errors */
         $errors = [];
         $keys = [];
         $advice = [];
@@ -65,80 +66,16 @@ final class LaravelRuleCatalogValidator
             }
         }
 
+        $ruleValidators = $this->ruleValidators($catalog, $keys, $advice, $errors);
         foreach ($catalog->rules() as $rule) {
-            if ($rule instanceof BuiltinRuleDefinition) {
-                $this->recordKey($rule->key(), $keys, $errors);
-                if (!in_array($rule->rule(), [
-                    BuiltinRuleDefinition::FRAMEWORK_CONSTRAINT,
-                    BuiltinRuleDefinition::PHP_CONSTRAINT,
-                    BuiltinRuleDefinition::SYMFONY_CONSTRAINT,
-                    BuiltinRuleDefinition::ILLUMINATE_SUPPORT,
-                    BuiltinRuleDefinition::SKELETON,
-                    BuiltinRuleDefinition::COMPOSER_VERSION,
-                    BuiltinRuleDefinition::CURL_EXTENSION,
-                    BuiltinRuleDefinition::HIGH_SIGNAL_SOURCE,
-                ], true)) {
-                    $errors[] = sprintf('Unsupported built-in rule type for %s: %s.', $rule->key(), $rule->rule());
-                }
-                $this->validateApplicability($catalog, $rule->key(), $rule->applicability(), $errors);
+            $ruleValidator = $ruleValidators[get_class($rule)] ?? null;
+            if ($ruleValidator === null) {
+                $errors[] = sprintf('Unsupported catalog rule definition: %s.', get_class($rule));
 
                 continue;
             }
-
-            if ($rule instanceof PackageRuleDefinition) {
-                $this->recordKey($rule->key(), $keys, $errors);
-                if ($rule->guidance() === []) {
-                    $errors[] = sprintf('Package rule %s has no guidance.', $rule->key());
-                }
-                $package = null;
-                foreach ($rule->guidance() as $guidance) {
-                    if ($package !== null && $package !== $guidance->package()) {
-                        $errors[] = sprintf('Package rule %s mixes guidance for multiple packages.', $rule->key());
-                    }
-                    $package = $guidance->package();
-                    $this->recordKey($guidance->key(), $keys, $errors);
-                    $this->validateConstraint($guidance->compatibleConstraint(), $guidance->key(), $errors);
-                    $this->validateSeverity($guidance->severity(), $guidance->key(), $errors);
-                    $this->validateSources($guidance->sources(), $guidance->key(), $errors);
-                    $this->validateAdviceApplicability($catalog, $guidance->key(), $guidance->applicability(), $errors);
-                    $this->recordAdvice($guidance->package(), $guidance->applicability(), $guidance->key(), $advice, $errors);
-                }
-
-                continue;
-            }
-
-            if ($rule instanceof PackageAdvisoryDefinition) {
-                $this->recordKey($rule->key(), $keys, $errors);
-                if (!in_array($rule->action(), [
-                    PackageAdvisoryDefinition::REPLACE_IGNITION,
-                    PackageAdvisoryDefinition::REMOVE_TRUSTED_PROXY,
-                    PackageAdvisoryDefinition::REVIEW_CORS_REMOVAL,
-                    PackageAdvisoryDefinition::PUBLISH_MIGRATIONS,
-                    PackageAdvisoryDefinition::REVIEW_DBAL_REMOVAL,
-                    PackageAdvisoryDefinition::REPLACE_FLYSYSTEM_SFTP,
-                    PackageAdvisoryDefinition::REVIEW_LEGACY_HELPERS,
-                ], true)) {
-                    $errors[] = sprintf('Unsupported package advisory action for %s: %s.', $rule->key(), $rule->action());
-                }
-                $expectedPackage = $rule->expectedPackage();
-                if ($expectedPackage !== null && $rule->package() !== $expectedPackage) {
-                    $errors[] = sprintf(
-                        'Package advisory %s uses action %s for %s; expected %s.',
-                        $rule->key(),
-                        $rule->action(),
-                        $rule->package(),
-                        $expectedPackage
-                    );
-                }
-                $this->validateSeverity($rule->severity(), $rule->key(), $errors);
-                $this->validateSources($rule->sources(), $rule->key(), $errors);
-                $this->validateAdviceApplicability($catalog, $rule->key(), $rule->applicability(), $errors);
-                if ($rule->action() !== PackageAdvisoryDefinition::PUBLISH_MIGRATIONS) {
-                    $this->recordAdvice($rule->package(), $rule->applicability(), $rule->key(), $advice, $errors);
-                }
-
-                continue;
-            }
+            $this->recordKey($rule->key(), $keys, $errors);
+            $ruleValidator($rule);
         }
 
         foreach ($catalog->skeletonPatterns() as $pattern) {
@@ -159,7 +96,127 @@ final class LaravelRuleCatalogValidator
         }
     }
 
-    /** @param array<string, true> $keys @param list<string> $errors */
+    /**
+     * The one dispatch table over rule-definition subtypes. A new subtype needs a
+     * single entry here, and an unmapped subtype is reported instead of skipped.
+     *
+     * @param array<string, true> $keys
+     * @param array<string, string> $advice
+     * @param list<string> $errors
+     *
+     * @return array<class-string<RuleDefinition>, \Closure(RuleDefinition): void>
+     */
+    private function ruleValidators(
+        LaravelRuleCatalog $catalog,
+        array &$keys,
+        array &$advice,
+        array &$errors
+    ): array {
+        return [
+            BuiltinRuleDefinition::class => function (RuleDefinition $rule) use ($catalog, &$errors): void {
+                if ($rule instanceof BuiltinRuleDefinition) {
+                    $this->validateBuiltinRule($catalog, $rule, $errors);
+                }
+            },
+            PackageRuleDefinition::class => function (RuleDefinition $rule) use ($catalog, &$keys, &$advice, &$errors): void {
+                if ($rule instanceof PackageRuleDefinition) {
+                    $this->validatePackageRule($catalog, $rule, $keys, $advice, $errors);
+                }
+            },
+            PackageAdvisoryDefinition::class => function (RuleDefinition $rule) use ($catalog, &$advice, &$errors): void {
+                if ($rule instanceof PackageAdvisoryDefinition) {
+                    $this->validatePackageAdvisory($catalog, $rule, $advice, $errors);
+                }
+            },
+        ];
+    }
+
+    /** @param list<string> $errors */
+    private function validateBuiltinRule(
+        LaravelRuleCatalog $catalog,
+        BuiltinRuleDefinition $rule,
+        array &$errors
+    ): void {
+        if (!in_array($rule->rule(), [
+            BuiltinRuleDefinition::FRAMEWORK_CONSTRAINT,
+            BuiltinRuleDefinition::PHP_CONSTRAINT,
+            BuiltinRuleDefinition::SYMFONY_CONSTRAINT,
+            BuiltinRuleDefinition::ILLUMINATE_SUPPORT,
+            BuiltinRuleDefinition::SKELETON,
+            BuiltinRuleDefinition::COMPOSER_VERSION,
+            BuiltinRuleDefinition::CURL_EXTENSION,
+            BuiltinRuleDefinition::HIGH_SIGNAL_SOURCE,
+        ], true)) {
+            $errors[] = sprintf('Unsupported built-in rule type for %s: %s.', $rule->key(), $rule->rule());
+        }
+        $this->validateApplicability($catalog, $rule->key(), $rule->applicability(), $errors);
+    }
+
+    /**
+     * @param array<string, true> $keys
+     * @param array<string, string> $advice
+     * @param list<string> $errors
+     */
+    private function validatePackageRule(
+        LaravelRuleCatalog $catalog,
+        PackageRuleDefinition $rule,
+        array &$keys,
+        array &$advice,
+        array &$errors
+    ): void {
+        if ($rule->guidance() === []) {
+            $errors[] = sprintf('Package rule %s has no guidance.', $rule->key());
+        }
+        $package = null;
+        foreach ($rule->guidance() as $guidance) {
+            if ($package !== null && $package !== $guidance->package()) {
+                $errors[] = sprintf('Package rule %s mixes guidance for multiple packages.', $rule->key());
+            }
+            $package = $guidance->package();
+            $this->recordKey($guidance->key(), $keys, $errors);
+            $this->validateConstraint($guidance->compatibleConstraint(), $guidance->key(), $errors);
+            $this->validateSeverity($guidance->severity(), $guidance->key(), $errors);
+            $this->validateSources($guidance->sources(), $guidance->key(), $errors);
+            $this->validateAdviceApplicability($catalog, $guidance->key(), $guidance->applicability(), $errors);
+            $this->recordAdvice($guidance->package(), $guidance->applicability(), $guidance->key(), $advice, $errors);
+        }
+    }
+
+    /**
+     * @param array<string, string> $advice
+     * @param list<string> $errors
+     */
+    private function validatePackageAdvisory(
+        LaravelRuleCatalog $catalog,
+        PackageAdvisoryDefinition $rule,
+        array &$advice,
+        array &$errors
+    ): void {
+        if (!PackageAdvisoryDefinition::isSupportedAction($rule->action())) {
+            $errors[] = sprintf('Unsupported package advisory action for %s: %s.', $rule->key(), $rule->action());
+        }
+        $expectedPackage = $rule->expectedPackage();
+        if ($expectedPackage !== null && $rule->package() !== $expectedPackage) {
+            $errors[] = sprintf(
+                'Package advisory %s uses action %s for %s; expected %s.',
+                $rule->key(),
+                $rule->action(),
+                $rule->package(),
+                $expectedPackage
+            );
+        }
+        $this->validateSeverity($rule->severity(), $rule->key(), $errors);
+        $this->validateSources($rule->sources(), $rule->key(), $errors);
+        $this->validateAdviceApplicability($catalog, $rule->key(), $rule->applicability(), $errors);
+        if ($rule->isExclusivePackageAdvice()) {
+            $this->recordAdvice($rule->package(), $rule->applicability(), $rule->key(), $advice, $errors);
+        }
+    }
+
+    /**
+     * @param array<string, true> $keys
+     * @param list<string> $errors
+     */
     private function recordKey(string $key, array &$keys, array &$errors): void
     {
         if (isset($keys[$key])) {
@@ -186,7 +243,10 @@ final class LaravelRuleCatalogValidator
         }
     }
 
-    /** @param list<string> $sources @param list<string> $errors */
+    /**
+     * @param list<string> $sources
+     * @param list<string> $errors
+     */
     private function validateSources(array $sources, string $owner, array &$errors): void
     {
         if ($sources === []) {
@@ -202,7 +262,10 @@ final class LaravelRuleCatalogValidator
         }
     }
 
-    /** @param list<RuleApplicability> $applicability @param list<string> $errors */
+    /**
+     * @param list<RuleApplicability> $applicability
+     * @param list<string> $errors
+     */
     private function validateApplicability(
         LaravelRuleCatalog $catalog,
         string $owner,
@@ -241,7 +304,10 @@ final class LaravelRuleCatalogValidator
         }
     }
 
-    /** @param array<string, string> $advice @param list<string> $errors */
+    /**
+     * @param array<string, string> $advice
+     * @param list<string> $errors
+     */
     private function recordAdvice(
         string $package,
         RuleApplicability $applicability,

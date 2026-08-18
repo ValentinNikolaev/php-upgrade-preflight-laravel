@@ -15,6 +15,10 @@ use PhpUpgradePreflight\Core\Model\ReportFormat;
 use PhpUpgradePreflight\Core\Model\RiskSummary;
 use PhpUpgradePreflight\Core\Model\UpgradeReport;
 use PhpUpgradePreflight\Core\Model\UpgradeRequest;
+use PhpUpgradePreflight\Core\Reporting\JsonReportWriter;
+use PhpUpgradePreflight\Core\Reporting\MarkdownReportWriter;
+use PhpUpgradePreflight\Core\Reporting\ReportWriter;
+use PhpUpgradePreflight\Core\Reporting\ReportWriterResolver;
 use PhpUpgradePreflight\Laravel\Commands\AnalyzeUpgradeCommand;
 use PHPUnit\Framework\TestCase;
 use Symfony\Component\Console\Command\Command;
@@ -35,6 +39,11 @@ final class AnalyzeUpgradeCommandTest extends TestCase
             '--source' => ['app'],
             '--with-extension' => ['ext-intl:72.1'],
             '--without-extension' => ['ext-xdebug'],
+            '--composer-mode' => 'restricted',
+            '--composer-executable' => '/tools/composer.phar',
+            '--composer-version' => '^2.8',
+            '--composer-timeout' => '120',
+            '--composer-diagnostic-timeout' => '15',
             '--format' => 'markdown',
         ], ['capture_stderr_separately' => true]);
 
@@ -51,9 +60,207 @@ final class AnalyzeUpgradeCommandTest extends TestCase
             $analyzer->request->extensionAssumptions()
         ));
         self::assertSame(ReportFormat::MARKDOWN, $analyzer->request->format());
+        self::assertSame('restricted', $analyzer->request->composerExecution()->mode());
+        self::assertSame('/tools/composer.phar', $analyzer->request->composerExecution()->executable());
+        self::assertSame('^2.8', $analyzer->request->composerExecution()->expectedVersion());
+        self::assertSame(120, $analyzer->request->composerExecution()->scenarioTimeoutSeconds());
+        self::assertSame(15, $analyzer->request->composerExecution()->diagnosticTimeoutSeconds());
         self::assertStringStartsWith('# PHP Upgrade Preflight', $tester->getDisplay());
         self::assertStringContainsString('Literal <info>canonical text</info> remains unchanged.', $tester->getDisplay());
         self::assertSame('', $tester->getErrorOutput());
+    }
+
+    /**
+     * The Artisan entry point renders through the shared core resolver, so a given `--format`
+     * value must produce exactly what the corresponding writer produces. Nothing between the
+     * analyzer and stdout is allowed to reshape the canonical projection.
+     */
+    public function testItRendersTheCanonicalJsonProjectionByteForByte(): void
+    {
+        $analyzer = new RecordingUpgradeAnalyzer();
+
+        $display = $this->renderedReport($analyzer, ReportFormat::JSON);
+
+        self::assertNotNull($analyzer->report);
+        self::assertSame($this->canonicalLines((new JsonReportWriter())->render($analyzer->report)), $display);
+    }
+
+    public function testItRendersTheMarkdownProjectionByteForByte(): void
+    {
+        $analyzer = new RecordingUpgradeAnalyzer();
+
+        $display = $this->renderedReport($analyzer, ReportFormat::MARKDOWN);
+
+        self::assertNotNull($analyzer->report);
+        self::assertSame($this->canonicalLines((new MarkdownReportWriter())->render($analyzer->report)), $display);
+    }
+
+    /** An unknown format never reaches rendering, so the resolver's JSON fallback stays reachable only from core. */
+    public function testTheSharedResolverBacksBothArtisanProjections(): void
+    {
+        $resolver = new ReportWriterResolver();
+
+        self::assertInstanceOf(ReportWriter::class, $resolver->resolve(ReportFormat::JSON));
+        self::assertInstanceOf(JsonReportWriter::class, $resolver->resolve(ReportFormat::JSON));
+        self::assertInstanceOf(MarkdownReportWriter::class, $resolver->resolve(ReportFormat::MARKDOWN));
+    }
+
+    private function renderedReport(RecordingUpgradeAnalyzer $analyzer, string $format): string
+    {
+        $tester = $this->commandTester($analyzer);
+
+        $exitCode = $tester->execute([
+            '--path' => dirname(__DIR__, 4),
+            '--target-php' => '8.2',
+            '--format' => $format,
+        ], ['capture_stderr_separately' => true]);
+
+        self::assertSame(Command::SUCCESS, $exitCode);
+        self::assertSame('', $tester->getErrorOutput());
+
+        return $this->canonicalLines($tester->getDisplay());
+    }
+
+    /**
+     * The writers join their lines with `PHP_EOL`, so a Windows host renders both the
+     * console display and the writer output with CRLF. Comparing the projections is a
+     * comparison of their content, so both sides are read with the same line endings.
+     */
+    private function canonicalLines(string $value): string
+    {
+        return trim(str_replace("\r\n", "\n", $value));
+    }
+
+    public function testItLoadsAProfileAndPassesItToTheAnalyzer(): void
+    {
+        $analyzer = new RecordingUpgradeAnalyzer();
+        $tester = $this->commandTester($analyzer);
+        $profilePath = dirname(__DIR__, 4) . '/tests/fixtures/platform-profiles/complete-php-83.json';
+
+        $exitCode = $tester->execute([
+            '--target-platform-profile' => [$profilePath],
+        ], ['capture_stderr_separately' => true]);
+
+        self::assertSame(Command::SUCCESS, $exitCode);
+        self::assertNotNull($analyzer->request);
+        self::assertNotNull($analyzer->request->targetPlatformProfile());
+        self::assertSame('file', $analyzer->request->targetPlatformProfile()->provenance());
+        self::assertSame('1.0', $analyzer->request->targetPlatformProfile()->schemaVersion());
+        self::assertSame('8.3.0', $analyzer->request->targetPhp());
+        self::assertSame('', $tester->getErrorOutput());
+    }
+
+    /** @dataProvider invalidProfileProvider */
+    public function testItRejectsInvalidProfilesWithoutDisclosingTheirPath(string $profilePath, string $message): void
+    {
+        $analyzer = new RecordingUpgradeAnalyzer();
+        $tester = $this->commandTester($analyzer);
+
+        $exitCode = $tester->execute([
+            '--target-platform-profile' => [$profilePath],
+        ], ['capture_stderr_separately' => true]);
+        $diagnostic = $tester->getErrorOutput();
+
+        self::assertSame(Command::INVALID, $exitCode);
+        self::assertNull($analyzer->request);
+        self::assertStringStartsWith('Invalid invocation:', $diagnostic);
+        self::assertStringContainsString($message, $diagnostic);
+        self::assertStringNotContainsString($profilePath, $diagnostic);
+    }
+
+    /** @return list<array{string, string}> */
+    public function invalidProfileProvider(): array
+    {
+        return [
+            [
+                dirname(__DIR__, 4) . '/tests/fixtures/platform-profiles/missing-secret-profile.json',
+                'Target platform profile file could not be read.',
+            ],
+            [
+                dirname(__DIR__, 4) . '/tests/fixtures/platform-profiles',
+                'Target platform profile file could not be read.',
+            ],
+            [
+                dirname(__DIR__, 4) . '/tests/fixtures/platform-profiles/malformed.json',
+                'Target platform profile contains invalid JSON.',
+            ],
+            [
+                dirname(__DIR__, 4) . '/tests/fixtures/platform-profiles/invalid-package-name.json',
+                'Target platform package name is unsupported.',
+            ],
+        ];
+    }
+
+    /**
+     * @dataProvider conflictingProfileInputProvider
+     * @param array<string, mixed> $input
+     */
+    public function testItRejectsProfileConflictsBeforeRunningAnalysis(array $input, string $message): void
+    {
+        $analyzer = new RecordingUpgradeAnalyzer();
+        $tester = $this->commandTester($analyzer);
+
+        $exitCode = $tester->execute($input, ['capture_stderr_separately' => true]);
+
+        self::assertSame(Command::INVALID, $exitCode);
+        self::assertNull($analyzer->request);
+        self::assertStringStartsWith('Invalid invocation:', $tester->getErrorOutput());
+        self::assertStringContainsString($message, $tester->getErrorOutput());
+    }
+
+    /** @return list<array{array<string, mixed>, string}> */
+    public function conflictingProfileInputProvider(): array
+    {
+        return [
+            [[
+                '--target-platform-profile' => [
+                    dirname(__DIR__, 4) . '/tests/fixtures/platform-profiles/partial-php-83-ext-json.json',
+                ],
+                '--without-extension' => ['ext-json'],
+            ], 'contradicts the target platform profile'],
+            [[
+                '--target-platform-profile' => [
+                    dirname(__DIR__, 4) . '/tests/fixtures/platform-profiles/partial-php-83-ext-json.json',
+                ],
+                '--with-extension' => ['ext-json:8.2.0'],
+            ], 'contradicts the target platform profile'],
+            [[
+                '--target-platform-profile' => [
+                    dirname(__DIR__, 4) . '/tests/fixtures/platform-profiles/complete-php-83.json',
+                ],
+                '--with-extension' => ['ext-json'],
+            ], 'presence-only'],
+        ];
+    }
+
+    public function testItRejectsRepeatedProfileOptionsWithoutRunningAnalysis(): void
+    {
+        $analyzer = new RecordingUpgradeAnalyzer();
+        $tester = $this->commandTester($analyzer);
+
+        $exitCode = $tester->execute([
+            '--target-platform-profile' => ['first.json', 'second.json'],
+        ], ['capture_stderr_separately' => true]);
+
+        self::assertSame(Command::INVALID, $exitCode);
+        self::assertNull($analyzer->request);
+        self::assertStringContainsString('may only be specified once', $tester->getErrorOutput());
+        self::assertStringNotContainsString('first.json', $tester->getErrorOutput());
+        self::assertStringNotContainsString('second.json', $tester->getErrorOutput());
+    }
+
+    public function testItRejectsANonStringProfileOptionWithoutRunningAnalysis(): void
+    {
+        $analyzer = new RecordingUpgradeAnalyzer();
+        $tester = $this->commandTester($analyzer);
+
+        $exitCode = $tester->execute([
+            '--target-platform-profile' => [123],
+        ], ['capture_stderr_separately' => true]);
+
+        self::assertSame(Command::INVALID, $exitCode);
+        self::assertNull($analyzer->request);
+        self::assertStringContainsString('must be a string', $tester->getErrorOutput());
     }
 
     /**
@@ -93,6 +300,11 @@ final class AnalyzeUpgradeCommandTest extends TestCase
                 '--with-extension' => ['ext-json'],
                 '--without-extension' => ['EXT-JSON'],
             ], 'may only be specified once'],
+            [[
+                '--path' => $projectPath,
+                '--target-php' => '8.2',
+                '--with-extension' => ['ext-a..b'],
+            ], 'must use Composer ext-name syntax'],
             [[
                 '--path' => $projectPath,
                 '--target-php' => '8.2',
@@ -180,12 +392,13 @@ final class AnalyzeUpgradeCommandTest extends TestCase
 final class RecordingUpgradeAnalyzer implements UpgradeAnalyzer
 {
     public ?UpgradeRequest $request = null;
+    public ?UpgradeReport $report = null;
 
     public function analyzeUpgrade(UpgradeRequest $request): UpgradeReport
     {
         $this->request = $request;
 
-        return new UpgradeReport(
+        return $this->report = new UpgradeReport(
             $request,
             new ProjectState($request->projectPath(), new ComposerJson([]), new ComposerLock([])),
             [],
